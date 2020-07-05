@@ -186,4 +186,8 @@ enum daos_dtx_alb {
 	ALB_AVAILABLE_DIRTY	= 2,
 };
 
+enum daos_tx_flags {
+	DTF_RETRY_COMMIT		= 1, /* TX commit will be retry. */
+};
+
 #endif /* __DAOS_DTX_H__ */

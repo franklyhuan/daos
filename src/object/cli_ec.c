@@ -1390,13 +1390,10 @@ out:
 }
 
 int
-obj_ec_req_reasb(daos_obj_rw_t *args, daos_obj_id_t oid,
+obj_ec_req_reasb(daos_iod_t *iods, d_sg_list_t *sgls, daos_obj_id_t oid,
 		 struct daos_oclass_attr *oca, struct obj_reasb_req *reasb_req,
-		 bool update)
+		 uint32_t iod_nr, bool update)
 {
-	daos_iod_t		*iods = args->iods;
-	d_sg_list_t		*sgls = args->sgls;
-	uint32_t		 iod_nr = args->nr;
 	int			 i, rc = 0;
 
 	if (!reasb_req->orr_size_fetch) {

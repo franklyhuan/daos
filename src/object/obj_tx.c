@@ -36,6 +36,7 @@
 #include <daos/mgmt.h>
 #include <daos/dtx.h>
 #include <daos/task.h>
+#include "obj_ec.h"
 #include "obj_rpc.h"
 #include "obj_internal.h"
 
@@ -105,8 +106,15 @@ struct dc_tx {
 	/** The read requests count */
 	uint32_t		 tx_read_cnt;
 
+	uint32_t		 tx_retry:1; /** Retry the commit RPC. */
+
 	/** Reference the pool. */
 	struct dc_pool		*tx_pool;
+
+	struct daos_cpd_sg	 tx_head;
+	struct daos_cpd_sg	 tx_reqs;
+	struct daos_cpd_sg	 tx_disp;
+	struct daos_cpd_sg	 tx_tgts;
 };
 
 static int
@@ -330,40 +338,50 @@ dc_tx_cleanup_one(struct dc_tx *tx, struct daos_cpd_sub_req *dcsr)
 
 	switch (dcsr->dcsr_opc) {
 	case DAOS_OBJ_RPC_UPDATE: {
+		struct obj_reasb_req	*reasb_req = dcsr->dcsr_reasb;
 		struct daos_cpd_update	*dcu = &dcsr->dcsr_update;
 		struct obj_iod_array	*iod_array = dcu->dcu_iods;
 		struct daos_csummer	*csummer;
 
 		csummer = dc_cont_hdl2csummer(tx->tx_coh);
 
-		if (dcu->dcu_iods != NULL) {
-			for (i = 0; i < dcsr->dcsr_nr; i++) {
-				daos_iov_free(&iod_array->oia_iods[i].iod_name);
-				D_FREE(iod_array->oia_iods[i].iod_recxs);
-			}
-
-			obj_io_desc_fini(iod_array->oia_oiods);
-			daos_csummer_free_ic(csummer,
-					     &iod_array->oia_iod_csums);
-			D_FREE(iod_array->oia_offs);
-			D_FREE(dcu->dcu_iods);
-		}
-
 		if (dcu->dcu_flags & DRF_CPD_BULK) {
 			for (i = 0; i < dcsr->dcsr_nr; i++) {
 				if (dcu->dcu_bulks[i] != CRT_BULK_NULL)
 					crt_bulk_free(dcu->dcu_bulks[i]);
 			}
-		} else if (dcu->dcu_sgls != NULL) {
-			for (i = 0; i < dcsr->dcsr_nr; i++)
-				daos_sgl_fini(&dcu->dcu_sgls[i],
-					!(tx->tx_flags & DAOS_TF_ZERO_COPY));
-
-			D_FREE(dcu->dcu_sgls);
 		}
 
 		daos_csummer_free_ci(csummer, &dcu->dcu_dkey_csum);
 		D_FREE(dcu->dcu_ec_tgts);
+
+		if (reasb_req != NULL) {
+			dcu->dcu_iods->oia_iods = reasb_req->orr_uiods;
+			dcsr->dcsr_sgls = reasb_req->orr_usgls;
+
+			obj_reasb_req_fini(reasb_req, dcsr->dcsr_nr);
+			D_FREE(dcsr->dcsr_reasb);
+		}
+
+		if (iod_array != NULL) {
+			for (i = 0; i < dcsr->dcsr_nr; i++) {
+				daos_iov_free(&iod_array->oia_iods[i].iod_name);
+				D_FREE(iod_array->oia_iods[i].iod_recxs);
+			}
+
+			daos_csummer_free_ic(csummer,
+					     &iod_array->oia_iod_csums);
+			D_ASSERT(iod_array->oia_offs == NULL);
+			D_FREE(dcu->dcu_iods);
+		}
+
+		if (dcsr->dcsr_sgls != NULL) {
+			for (i = 0; i < dcsr->dcsr_nr; i++)
+				daos_sgl_fini(&dcsr->dcsr_sgls[i],
+					!(tx->tx_flags & DAOS_TF_ZERO_COPY));
+
+			D_FREE(dcsr->dcsr_sgls);
+		}
 
 		daos_iov_free(&dcsr->dcsr_dkey);
 		break;
@@ -403,9 +421,11 @@ dc_tx_cleanup_one(struct dc_tx *tx, struct daos_cpd_sub_req *dcsr)
 static void
 dc_tx_cleanup(struct dc_tx *tx)
 {
-	uint32_t	from;
-	uint32_t	to;
-	uint32_t	i;
+	struct daos_cpd_sub_head	*dcsh = tx->tx_head.dcs_buf;
+	struct daos_cpd_disp_ent	*dcde = tx->tx_disp.dcs_buf;
+	uint32_t			 from;
+	uint32_t			 to;
+	uint32_t			 i;
 
 	if (tx->tx_flags & DAOS_TF_RDONLY)
 		from = tx->tx_total_slots - tx->tx_read_cnt;
@@ -420,6 +440,19 @@ dc_tx_cleanup(struct dc_tx *tx)
 
 	tx->tx_read_cnt = 0;
 	tx->tx_write_cnt = 0;
+
+	if (dcsh != NULL) {
+		D_FREE(dcsh->dcsh_mbs);
+		D_FREE(tx->tx_head.dcs_buf);
+	}
+
+	if (dcde != NULL) {
+		for (i = 0; i < tx->tx_disp.dcs_nr; i++)
+			D_FREE(dcde[i].dcde_reqs);
+		D_FREE(tx->tx_disp.dcs_buf);
+	}
+
+	D_FREE(tx->tx_tgts.dcs_buf);
 }
 
 int
@@ -640,154 +673,755 @@ dc_tx_open(tse_task_t *task)
 }
 
 struct tx_commit_cb_args {
-	struct dc_tx	*tcca_tx;
-	crt_rpc_t	*tcca_req;
+	struct dc_tx		*tcca_tx;
+	crt_rpc_t		*tcca_req;
+	daos_tx_commit_t	*tcca_args;
 };
 
 static int
 dc_tx_commit_cb(tse_task_t *task, void *data)
 {
-	struct tx_commit_cb_args *tcca = (struct tx_commit_cb_args *)data;
+	struct tx_commit_cb_args *tcca = *(struct tx_commit_cb_args **)data;
 	struct dc_tx		 *tx = tcca->tcca_tx;
 	crt_rpc_t		 *req = tcca->tcca_req;
+	struct obj_cpd_out	 *oco = crt_reply_get(req);
 	int			  rc = task->dt_result;
+	bool			  locked = true;
 
 	D_MUTEX_LOCK(&tx->tx_lock);
 
 	if (rc == 0) {
+		rc = oco->oco_ret;
+		if (rc == 0) {
+			int	*sub_rets = oco->oco_sub_rets.ca_arrays;
+
+			/* FIXME: currently, we pack one DTX in one CPD RPC. */
+			rc = sub_rets[0];
+		}
+	}
+
+	if (rc == 0) {
 		tx->tx_status = TX_COMMITTED;
+		tx->tx_retry = 0;
+		dc_tx_cleanup(tx);
+
 		goto out;
 	}
 
 	tx->tx_status = TX_FAILED;
 
-	/* Required to restart the TX with newer epoch. */
-	if (rc == -DER_TX_RESTART)
+	/* Be required to restart the TX with newer epoch. */
+	if (rc == -DER_TX_RESTART) {
+		tx->tx_pm_ver = oco->oco_map_version;
+		task->dt_result = rc;
+		/* Set retry flag even if it is restarted. */
+		tx->tx_retry = 1;
+
 		goto out;
-
-	/* FIXME:
-	 * 1. Check pool map, if pool map is refreshed, restart TX.
-	 * 2. Retry the RPC if it is retriable error.
-	 * 3. Failout for other failures.
-	 */
-
-out:
-	crt_req_decref(req);
-	D_MUTEX_UNLOCK(&tx->tx_lock);
-	/* -1 for dc_tx_commit() held */
-	dc_tx_decref(tx);
-
-	return rc;
-}
-
-static int
-dc_tx_elect_leader(struct dc_tx *tx)
-{
-	/* FIXME: elect leader. */
-
-	return 0;
-}
-
-int
-dc_tx_non_cpd_cb(daos_handle_t th, int result)
-{
-	struct dc_tx	*tx;
-
-	tx = dc_tx_hdl2ptr(th);
-	if (tx == NULL)
-		return -DER_NO_HDL;
-
-	D_MUTEX_LOCK(&tx->tx_lock);
-	if (result != 0)
-		tx->tx_status = TX_FAILED;
-	else
-		tx->tx_status = TX_COMMITTED;
-	D_MUTEX_UNLOCK(&tx->tx_lock);
-
-	dc_tx_decref(tx);
-
-	return 0;
-}
-
-static int
-dc_tx_commit_non_cpd(tse_task_t *task, struct dc_tx *tx)
-{
-	struct daos_cpd_sub_req	*dcsr;
-	struct dc_obj_epoch	 epoch = tx->tx_epoch;
-	uint32_t		 pm_ver = tx->tx_pm_ver;
-	int			 rc;
-
-	tx->tx_status = TX_COMMITTING;
-	dcsr = &tx->tx_req_cache[tx->tx_total_slots >> 1];
-
-	D_MUTEX_UNLOCK(&tx->tx_lock);
-
-	if (dcsr->dcsr_opc == DCSO_UPDATE) {
-		daos_obj_update_t	*args = dc_task_get_args(task);
-
-		args->th = dc_tx_ptr2hdl(tx);
-		args->oh = obj_ptr2hdl(dcsr->dcsr_obj);
-		args->flags = dcsr->dcsr_api_flags;
-		args->dkey = &dcsr->dcsr_dkey;
-		args->nr = dcsr->dcsr_nr;
-		args->iods = dcsr->dcsr_update.dcu_iods->oia_iods;
-		args->sgls = dcsr->dcsr_update.dcu_sgls;
-		args->ioms = NULL;
-
-		rc = dc_obj_update(task, &epoch, pm_ver, args);
-	} else {
-		daos_obj_punch_t	*args = dc_task_get_args(task);
-		uint32_t		 opc;
-
-		args->th = dc_tx_ptr2hdl(tx);
-		args->oh = obj_ptr2hdl(dcsr->dcsr_obj);
-		args->dkey = &dcsr->dcsr_dkey;
-		args->akeys = dcsr->dcsr_punch.dcp_akeys;
-		args->flags = dcsr->dcsr_api_flags;
-		args->akey_nr = dcsr->dcsr_nr;
-
-		switch (dcsr->dcsr_opc) {
-		case DCSO_PUNCH_OBJ:
-			opc = DAOS_OBJ_RPC_PUNCH;
-			break;
-		case DCSO_PUNCH_DKEY:
-			opc = DAOS_OBJ_RPC_PUNCH_DKEYS;
-			break;
-		case DCSO_PUNCH_AKEY:
-			opc = DAOS_OBJ_RPC_PUNCH_AKEYS;
-			break;
-		default:
-			D_ASSERT(0);
-		}
-
-		rc = dc_obj_punch(task, &epoch, pm_ver, opc, args);
 	}
 
+	D_ASSERTF(tx->tx_pm_ver >= oco->oco_map_version,
+		  "Invalid pm version for TX "DF_DTI": TX ver %u, RPC ver %u\n",
+		  DP_DTI(&tx->tx_id), tx->tx_pm_ver, oco->oco_map_version);
+
+	if (!obj_retry_error(rc)) {
+		task->dt_result = rc;
+		tx->tx_retry = 0;
+
+		goto out;
+	}
+
+	/* Keep the retry flag until TX is closed. */
+	tx->tx_retry = 1;
+	tcca->tcca_args->flags |= DTF_RETRY_COMMIT;
+
+	D_MUTEX_UNLOCK(&tx->tx_lock);
+	locked = false;
+
+	/* CPD RPC retry, do not need to refresh the pool map, because if
+	 * client pool map is stale, we should have hit '-DER_TX_RESTART'.
+	 */
+	rc = dc_task_resched(task);
+	if (rc != 0) {
+		D_ERROR("Failed to re-init task (%p): "DF_RC"\n",
+			task, DP_RC(rc));
+		task->dt_result = rc;
+	}
+
+out:
+	if (rc == 0 || tx->tx_retry) {
+		uint64_t	*sub_epochs = oco->oco_sub_epochs.ca_arrays;
+
+		/* FIXME: currently, we pack one DTX in one CPD RPC. */
+		if (tx->tx_epoch.oe_value < sub_epochs[0])
+			tx->tx_epoch.oe_value = sub_epochs[0];
+		else if (sub_epochs[0] == 0 && tx->tx_status == TX_COMMITTED)
+			D_WARN("Server forgot to reply epoch for TX "DF_DTI"\n",
+			       DP_DTI(&tx->tx_id));
+	}
+
+	if (locked)
+		D_MUTEX_UNLOCK(&tx->tx_lock);
+
+	crt_req_decref(req);
 	/* -1 for dc_tx_commit() held */
 	dc_tx_decref(tx);
 
 	return rc;
 }
 
+struct dc_tx_req_group {
+	uint32_t			 dtrg_rank;
+	uint32_t			 dtrg_tgt_idx;
+	uint32_t			 dtrg_read_cnt;
+	uint32_t			 dtrg_write_cnt;
+	uint32_t			 dtrg_slot_cnt;
+	struct daos_cpd_req_idx		*dtrg_req_idx;
+};
+
+struct dc_tx_rdg {
+	d_list_t			 dtr_link;
+	struct dtx_redundancy_group	 dtr_group;
+};
+
 static int
-dc_tx_commit_trigger(tse_task_t *task, struct dc_tx *tx)
+dx_tx_bulk_prepare(struct daos_cpd_sub_req *dcsr, tse_task_t *task)
+{
+	struct daos_cpd_update		*dcu = &dcsr->dcsr_update;
+	crt_bulk_t			*bulks = NULL;
+	int				 rc;
+
+	rc = obj_bulk_prep(dcu->dcu_sgls, dcsr->dcsr_nr, true, CRT_BULK_RO,
+			   task, &bulks);
+	if (rc == 0) {
+		dcu->dcu_bulks = bulks;
+		/* For most of cases, the leader will dispatch the sub request
+		 * to other servers, so use bind mode for bulk data transfer.
+		 */
+		dcu->dcu_flags |= ORF_BULK_BIND | DRF_CPD_BULK;
+	}
+
+	return rc;
+}
+
+/* Classify the update sub request. It is unnecessary to cleanup when
+ * hit failure. That will be done via dc_tx_cleanup() sometime later.
+ *
+ * Return sgl size or negative value on error.
+ */
+static int
+dc_tx_classify_update(struct dc_tx *tx, struct daos_cpd_sub_req *dcsr,
+		      struct daos_csummer *csummer)
+{
+	struct daos_cpd_update		*dcu = &dcsr->dcsr_update;
+	struct dc_object		*obj = dcsr->dcsr_obj;
+	struct dcs_layout		*singv_los = NULL;
+	struct daos_oclass_attr		*oca = NULL;
+	int				 rc = 0;
+
+	if (daos_oclass_is_ec(obj->cob_md.omd_id, &oca)) {
+		struct obj_reasb_req	*reasb_req;
+
+		D_ALLOC_PTR(reasb_req);
+		if (reasb_req == NULL)
+			return rc = -DER_NOMEM;
+
+		dcu->dcu_flags |= ORF_EC;
+		/* dcsr->dcsr_reasb will be released via
+		 * dc_tx_cleanup().
+		 */
+		dcsr->dcsr_reasb = reasb_req;
+		rc = obj_reasb_req_init(dcsr->dcsr_reasb,
+					dcu->dcu_iods->oia_iods,
+					dcsr->dcsr_nr, oca);
+		if (rc != 0)
+			return rc;
+
+		rc = obj_ec_req_reasb(dcu->dcu_iods->oia_iods, dcsr->dcsr_sgls,
+				      obj->cob_md.omd_id, oca,
+				      dcsr->dcsr_reasb, dcsr->dcsr_nr, true);
+		if (rc != 0)
+			return rc;
+
+		singv_los = reasb_req->orr_singv_los;
+
+		/* Overwrite the dcu->dcu_iods->oia_iods */
+		D_ASSERT(dcu->dcu_iods->oia_iods == reasb_req->orr_uiods);
+		dcu->dcu_iods->oia_iods = reasb_req->orr_iods;
+
+		/* Overwrite the dcsr->dcsr_sgls */
+		D_ASSERT(dcsr->dcsr_sgls == reasb_req->orr_usgls);
+		dcsr->dcsr_sgls = reasb_req->orr_sgls;
+
+		dcu->dcu_iods->oia_oiods = reasb_req->orr_oiods;
+		dcu->dcu_iods->oia_offs = NULL;
+	} else {
+		dcu->dcu_iods->oia_oiods = NULL;
+		dcu->dcu_iods->oia_offs = NULL;
+	}
+
+	if (dcu->dcu_iods->oia_oiods != NULL)
+		dcu->dcu_iods->oia_oiod_nr = dcsr->dcsr_nr;
+	else
+		dcu->dcu_iods->oia_oiod_nr = 0;
+
+	if (daos_csummer_initialized(csummer)) {
+		rc = daos_csummer_calc_key(csummer, &dcsr->dcsr_dkey,
+					   &dcu->dcu_dkey_csum);
+		if (rc != 0)
+			return rc;
+
+		rc = daos_csummer_calc_iods(csummer, dcsr->dcsr_sgls,
+					    dcu->dcu_iods->oia_iods, NULL,
+					    dcsr->dcsr_nr, false, singv_los, -1,
+					    &dcu->dcu_iods->oia_iod_csums);
+	}
+
+	if (rc == 0)
+		rc = daos_sgls_packed_size(dcsr->dcsr_sgls, dcsr->dcsr_nr, NULL);
+
+	return rc;
+}
+
+static int
+dc_tx_classify_common(struct dc_tx *tx, struct daos_cpd_sub_req *dcsr,
+		      struct dc_tx_req_group *dtrgs, int dtrg_nr,
+		      uint32_t grp_idx, uint32_t req_idx, bool read, bool all,
+		      uint32_t *leader_dtrg_idx, uint32_t *act_tgt_cnt,
+		      d_list_t *dtr_list, daos_unit_oid_t *leader_oid)
+{
+	struct dc_object	*obj = dcsr->dcsr_obj;
+	struct dc_obj_shard	*shard;
+	struct dc_tx_req_group	*dtrg;
+	struct dc_tx_req_group	*tmp;
+	struct daos_cpd_req_idx	*dcri;
+	struct dc_tx_rdg	*dtr;
+	struct dc_tx_rdg	*leader_dtr;
+	struct daos_oclass_attr	*oca;
+	struct daos_cpd_update	*dcu = NULL;
+	struct obj_reasb_req	*reasb_req = NULL;
+	uint32_t		 size;
+	int			 local_tgt_cnt = 0;
+	int			 skipped_parity = 0;
+	int			 handled = 0;
+	int			 start;
+	int			 rc = 0;
+	int			 idx;
+
+	if (d_list_empty(dtr_list))
+		leader_dtr = NULL;
+	else
+		leader_dtr = d_list_entry(dtr_list->next, struct dc_tx_rdg,
+					  dtr_link);
+
+	oca = daos_oclass_attr_find(obj->cob_md.omd_id);
+	size = sizeof(*dtr) + sizeof(uint32_t) * obj->cob_grp_size;
+	D_ALLOC(dtr, size);
+	if (dtr == NULL)
+		return -DER_NOMEM;
+
+	start = grp_idx * obj->cob_grp_size;
+	dcsr->dcsr_ec_tgt_nr = 0;
+
+	if (dcsr->dcsr_opc == DCSO_UPDATE) {
+		dcu = &dcsr->dcsr_update;
+		reasb_req = dcsr->dcsr_reasb;
+		if (dcu->dcu_flags & ORF_EC && reasb_req->tgt_bitmap != NULL) {
+			D_ALLOC_ARRAY(dcu->dcu_ec_tgts, obj->cob_grp_size);
+			if (dcu->dcu_ec_tgts == NULL)
+				D_GOTO(out, rc = -DER_NOMEM);
+
+			dcu->dcu_start_shard = start;
+		}
+	}
+
+	/* Descending order to guarantee that EC parity is handled firstly. */
+	for (idx = start + obj->cob_grp_size - 1; idx >= start; idx--) {
+		if (reasb_req != NULL &&
+		    !isset(reasb_req->tgt_bitmap, idx - start))
+			continue;
+
+		rc = obj_shard_open(obj, idx, tx->tx_pm_ver, &shard);
+		if (rc == -DER_NONEXIST) {
+			if (oca->ca_resil == DAOS_RES_EC && !all) {
+				if (idx >= start + obj->cob_grp_size -
+							oca->u.ec.e_p) {
+					skipped_parity++;
+				} else if (skipped_parity == oca->u.ec.e_p) {
+					D_ERROR("Two many (%d) shards in the "
+						"redundancy group for opc %u "
+						"against the obj "DF_OID
+						" for DTX "DF_DTI" are lost\n",
+						skipped_parity + 1,
+						dcsr->dcsr_opc,
+						DP_OID(obj->cob_md.omd_id),
+						DP_DTI(&tx->tx_id));
+					D_GOTO(out, rc = -DER_IO);
+				}
+			}
+
+			continue;
+		}
+
+		if (rc != 0)
+			goto out;
+
+		D_ASSERTF(shard->do_target_id < dtrg_nr,
+			  "Invalid target index: idx %u, targets %u\n",
+			  shard->do_target_id, dtrg_nr);
+
+		dtrg = &dtrgs[shard->do_target_id];
+		if (dtrg->dtrg_req_idx == NULL) {
+			/* dtrg->dtrg_req_idx will be released by caller. */
+			D_ALLOC_ARRAY(dtrg->dtrg_req_idx, DTX_SUB_REQ_DEF);
+			if (dtrg->dtrg_req_idx == NULL) {
+				obj_shard_close(shard);
+				D_GOTO(out, rc = -DER_NOMEM);
+			}
+
+			dtrg->dtrg_rank = shard->do_target_rank;
+			dtrg->dtrg_tgt_idx = shard->do_target_idx;
+			dtrg->dtrg_slot_cnt = DTX_SUB_REQ_DEF;
+			(*act_tgt_cnt)++;
+		} else {
+			D_ASSERTF(dtrg->dtrg_rank == shard->do_target_rank,
+				  "Invalid target rank for shard ID %u: "
+				  "rank1 %u, rank2 %u\n", shard->do_target_id,
+				  shard->do_target_rank, dtrg->dtrg_rank);
+
+			D_ASSERTF(dtrg->dtrg_tgt_idx == shard->do_target_idx,
+				  "Invalid target index for shard ID %u: "
+				  "idx1 %u, idx2 %u\n", shard->do_target_id,
+				  shard->do_target_idx, dtrg->dtrg_tgt_idx);
+		}
+
+		if ((dtrg->dtrg_read_cnt + dtrg->dtrg_write_cnt) >=
+		    dtrg->dtrg_slot_cnt) {
+			D_ALLOC_ARRAY(dcri, dtrg->dtrg_slot_cnt << 1);
+			if (dcri == NULL) {
+				obj_shard_close(shard);
+				D_GOTO(out, rc = -DER_NOMEM);
+			}
+
+			memcpy(dcri, dtrg->dtrg_req_idx,
+			       sizeof(*dcri) * dtrg->dtrg_slot_cnt);
+			D_FREE(dtrg->dtrg_req_idx);
+			dtrg->dtrg_req_idx = dcri;
+			dtrg->dtrg_slot_cnt <<= 1;
+		}
+
+		dcri = &dtrg->dtrg_req_idx[dtrg->dtrg_read_cnt +
+					   dtrg->dtrg_write_cnt];
+		dcri->dcri_shard_idx = shard->do_shard;
+		dcri->dcri_req_idx = req_idx;
+
+		if (read)
+			dtrg->dtrg_read_cnt++;
+		else
+			dtrg->dtrg_write_cnt++;
+
+		/* XXX: Rules for electing leader:
+		 *
+		 * R1: For non read-only TX, the DAOS target that only contains
+		 *     read sub requests will not be as the leader.
+		 *
+		 * R2: The DAOS target that holds the most sub requests will be
+		 *     elected as the leader.
+		 *
+		 * R3: If more than one DAOS targets have the some count of sub
+		 *     requests, then the 1st parsed one will be elected as the
+		 *     leader. That depends on the sub request operation object
+		 *     and dkey. It is random from the whole system perspective.
+		 *     So it is helpful for the server load balance. But it may
+		 *     affect the degree of leader async DTX batched commit.
+		 *
+		 * R4: The replicas count and redundancy groups count have very
+		 *     limited influence on DTX recovery. Because as long as if
+		 *     the DTX participants belong to the same redundancy group
+		 *     are all unavailable, in spite of which redundancy group,
+		 *     and in spite of where the leader is, such DTX cannot be
+		 *     recovered.
+		 */
+		tmp = &dtrgs[*leader_dtrg_idx];
+		if (dtrg->dtrg_write_cnt != 0) {
+			if ((dtrg->dtrg_read_cnt + dtrg->dtrg_write_cnt) >
+			    (tmp->dtrg_read_cnt + tmp->dtrg_write_cnt)) {
+				*leader_dtrg_idx = shard->do_target_id;
+				leader_dtr = dtr;
+				leader_oid->id_pub = obj->cob_md.omd_id;
+				leader_oid->id_shard = idx;
+			}
+		} else if (tmp->dtrg_write_cnt == 0) {
+			if (dtrg->dtrg_read_cnt > tmp->dtrg_read_cnt) {
+				*leader_dtrg_idx = shard->do_target_id;
+				leader_dtr = dtr;
+			}
+		}
+
+		dtr->dtr_group.drg_ids[local_tgt_cnt++] = shard->do_target_id;
+		obj_shard_close(shard);
+		handled++;
+
+		if (dcu != NULL && dcu->dcu_ec_tgts != NULL)
+			dcu->dcu_ec_tgts[dcsr->dcsr_ec_tgt_nr++] =
+							shard->do_target_id;
+	}
+
+	if (handled == 0) {
+		D_ERROR("All shards in the redundancy group for the opc %u "
+			"against the obj "DF_OID" for DTX "DF_DTI" are lost\n",
+			dcsr->dcsr_opc, DP_OID(obj->cob_md.omd_id),
+			DP_DTI(&tx->tx_id));
+		D_GOTO(out, rc = -DER_IO);
+	}
+
+	dtr->dtr_group.drg_tgt_cnt = local_tgt_cnt;
+	if (oca->ca_resil == DAOS_RES_EC && !all) {
+		dtr->dtr_group.drg_redundancy = oca->u.ec.e_p + 1;
+		D_ASSERT(dtr->dtr_group.drg_redundancy <= obj->cob_grp_size);
+	} else {
+		dtr->dtr_group.drg_redundancy = local_tgt_cnt;
+	}
+
+	if (leader_dtr == dtr)
+		d_list_add(&dtr->dtr_link, dtr_list);
+	else
+		d_list_add_tail(&dtr->dtr_link, dtr_list);
+
+out:
+	if (rc == -DER_NONEXIST)
+		rc = 0;
+
+	if (rc != 0)
+		D_FREE(dtr);
+
+	return rc;
+}
+
+static bool
+dc_tx_same_rdg(struct dtx_redundancy_group *grp1,
+	       struct dtx_redundancy_group *grp2)
+{
+	int	i;
+
+	if (grp1->drg_tgt_cnt != grp2->drg_tgt_cnt)
+		return false;
+
+	if (grp1->drg_redundancy != grp2->drg_redundancy)
+		return false;
+
+	/* FIXME: The comparison between two ID arrays are unsorted.
+	 *	  So for the case of ID1 = {1,2,3} and ID2 = {3,1,2}
+	 *	  will get 'false' result. It will cause some space
+	 *	  overhead, but not fatal.
+	 */
+	for (i = 0; i < grp1->drg_tgt_cnt; i++) {
+		if (grp1->drg_ids[i] != grp2->drg_ids[i])
+			return false;
+	}
+
+	return true;
+}
+
+static size_t
+dc_tx_reduce_rdgs(d_list_t *dtr_list, uint32_t *grp_cnt)
+{
+	struct dc_tx_rdg	*dtr;
+	struct dc_tx_rdg	*tmp;
+	struct dc_tx_rdg	*next;
+	struct dc_tx_rdg	*leader;
+	size_t			 size = 0;
+
+	*grp_cnt = 0;
+	leader = d_list_entry(dtr_list->next, struct dc_tx_rdg, dtr_link);
+	d_list_del(&leader->dtr_link);
+
+	/* Filter the dtrs that are the same as @leader. */
+	d_list_for_each_entry_safe(dtr, next, dtr_list, dtr_link) {
+		if (dc_tx_same_rdg(&leader->dtr_group, &dtr->dtr_group)) {
+			d_list_del(&dtr->dtr_link);
+			D_FREE(dtr);
+		}
+	}
+
+	if (!d_list_empty(dtr_list)) {
+		tmp = d_list_entry(dtr_list->next, struct dc_tx_rdg,
+				   dtr_link);
+		d_list_del(&tmp->dtr_link);
+
+		/* XXX: Try to merge the other non-leaders if possible.
+		 *	Consider efficiency, just one cycle scan. We do
+		 *	NOT guarantee all mergeable ones will be merged.
+		 */
+		d_list_for_each_entry_safe(dtr, next, dtr_list, dtr_link) {
+			if (dc_tx_same_rdg(&tmp->dtr_group, &dtr->dtr_group)) {
+				d_list_del(&tmp->dtr_link);
+				D_FREE(dtr);
+			} else {
+				size += sizeof(struct dtx_redundancy_group) +
+					sizeof(uint32_t) *
+					dtr->dtr_group.drg_tgt_cnt;
+				(*grp_cnt)++;
+			}
+		}
+
+		d_list_add(&tmp->dtr_link, dtr_list);
+		size += sizeof(struct dtx_redundancy_group) +
+			sizeof(uint32_t) * tmp->dtr_group.drg_tgt_cnt;
+		(*grp_cnt)++;
+	}
+
+	d_list_add(&leader->dtr_link, dtr_list);
+	size += sizeof(struct dtx_redundancy_group) +
+		sizeof(uint32_t) * leader->dtr_group.drg_tgt_cnt;
+	(*grp_cnt)++;
+
+	return size;
+}
+
+static void
+dc_tx_dump(struct dc_tx *tx)
+{
+	D_DEBUG(DB_TRACE,
+		"Dump TX %p:\n"
+		"ID: "DF_DTI"\n"
+		"epoch: "DF_U64"\n"
+		"flags: "DF_U64"\n"
+		"pm_ver: %u\n"
+		"leader: %u/%u\n"
+		"read_cnt: %u\n"
+		"write_cnt: %u\n"
+		"head: %p/%u\n"
+		"reqs: %p/%u\n"
+		"disp: %p/%u\n"
+		"tgts: %p/%u\n",
+		tx, DP_DTI(&tx->tx_id), tx->tx_epoch.oe_value, tx->tx_flags,
+		tx->tx_pm_ver, tx->tx_leader_rank, tx->tx_leader_tag,
+		tx->tx_read_cnt, tx->tx_write_cnt,
+		tx->tx_head.dcs_buf, tx->tx_head.dcs_nr,
+		tx->tx_reqs.dcs_buf, tx->tx_reqs.dcs_nr,
+		tx->tx_disp.dcs_buf, tx->tx_disp.dcs_nr,
+		tx->tx_tgts.dcs_buf, tx->tx_tgts.dcs_nr);
+}
+
+static int
+dc_tx_commit_prepare(struct dc_tx *tx, tse_task_t *task)
+{
+	daos_unit_oid_t			 leader_oid = { 0 };
+	struct daos_csummer		*csummer;
+	struct dc_tx_req_group		*dtrgs = NULL;
+	struct daos_cpd_sub_head	*dcsh = NULL;
+	struct daos_cpd_disp_ent	*dcdes = NULL;
+	struct daos_shard_tgt		*shard_tgts = NULL;
+	struct dtx_memberships		*mbs;
+	struct dtx_daos_target		*ddt;
+	struct dc_tx_rdg		*dtr;
+	void				*ptr;
+	d_list_t			 dtr_list;
+	daos_size_t			 sgl_size = 0;
+	size_t				 size;
+	uint32_t			 leader_dtrg_idx = 0;
+	uint32_t			 act_tgt_cnt = 0;
+	uint32_t			 act_grp_cnt = 0;
+	uint32_t			 start;
+	uint32_t			 tgt_cnt;
+	uint32_t			 req_cnt;
+	int				 rc = 0;
+	int				 i;
+	int				 j;
+
+	D_INIT_LIST_HEAD(&dtr_list);
+	csummer = dc_cont_hdl2csummer(tx->tx_coh);
+	req_cnt = tx->tx_read_cnt + tx->tx_write_cnt;
+	tgt_cnt = pool_map_target_nr(tx->tx_pool->dp_map);
+	D_ASSERT(tgt_cnt != 0);
+
+	if (tx->tx_flags & DAOS_TF_RDONLY)
+		start = tx->tx_total_slots - tx->tx_read_cnt;
+	else if (tx->tx_total_slots > DTX_SUB_WRITE_MAX)
+		start = tx->tx_total_slots - DTX_SUB_WRITE_MAX - tx->tx_read_cnt;
+	else
+		start = (tx->tx_total_slots >> 1) - tx->tx_read_cnt;
+
+	D_ALLOC_ARRAY(dtrgs, tgt_cnt);
+	if (dtrgs == NULL)
+		D_GOTO(out, rc = -DER_NOMEM);
+
+	for (i = 0; i < req_cnt; i++) {
+		struct daos_cpd_sub_req	*dcsr = &tx->tx_req_cache[i + start];
+		struct dc_object	*obj = dcsr->dcsr_obj;
+
+		if (dcsr->dcsr_opc == DCSO_UPDATE) {
+			rc = dc_tx_classify_update(tx, dcsr, csummer);
+			if (rc < 0)
+				goto out;
+
+			sgl_size += rc;
+			if (sgl_size >= OBJ_BULK_LIMIT) {
+				rc = dx_tx_bulk_prepare(dcsr, task);
+				if (rc != 0)
+					goto out;
+			} else {
+				dcsr->dcsr_update.dcu_sgls = dcsr->dcsr_sgls;
+			}
+		}
+
+		if (dcsr->dcsr_opc == DCSO_PUNCH_OBJ) {
+			for (j = 0; j < obj->cob_grp_nr; j++) {
+				rc = dc_tx_classify_common(tx, dcsr, dtrgs,
+						tgt_cnt, j, i, false, true,
+						&leader_dtrg_idx, &act_tgt_cnt,
+						&dtr_list, &leader_oid);
+				if (rc != 0)
+					goto out;
+			}
+		} else {
+			rc = obj_dkey2grpidx(obj, dcsr->dcsr_dkey_hash,
+					     tx->tx_pm_ver);
+			if (rc < 0)
+				goto out;
+
+			rc = dc_tx_classify_common(tx, dcsr, dtrgs, tgt_cnt, rc,
+					i, dcsr->dcsr_opc == DCSO_READ, false,
+					&leader_dtrg_idx, &act_tgt_cnt,
+					&dtr_list, &leader_oid);
+			if (rc != 0)
+				goto out;
+		}
+	}
+
+	size = dc_tx_reduce_rdgs(&dtr_list, &act_grp_cnt);
+	size += sizeof(*ddt) * act_tgt_cnt;
+
+	D_ALLOC_PTR(dcsh);
+	if (dcsh == NULL)
+		D_GOTO(out, rc = -DER_NOMEM);
+
+	D_ALLOC(dcsh->dcsh_mbs, size + sizeof(*dcsh->dcsh_mbs));
+	if (dcsh->dcsh_mbs == NULL)
+		D_GOTO(out, rc = -DER_NOMEM);
+
+	D_ALLOC_ARRAY(dcdes, act_tgt_cnt);
+	if (dcdes == NULL)
+		D_GOTO(out, rc = -DER_NOMEM);
+
+	D_ALLOC_ARRAY(shard_tgts, act_tgt_cnt);
+	if (shard_tgts == NULL)
+		D_GOTO(out, rc = -DER_NOMEM);
+
+	dcsh->dcsh_xid = tx->tx_id;
+	dcsh->dcsh_leader_oid = leader_oid;
+	dcsh->dcsh_epoch = tx->tx_epoch.oe_value;
+
+	mbs = dcsh->dcsh_mbs;
+	mbs->dm_tgt_cnt = act_tgt_cnt;
+	mbs->dm_grp_cnt = act_grp_cnt;
+	mbs->dm_data_size = size;
+
+	ddt = &mbs->dm_tgts[0];
+	ddt->ddt_id = leader_dtrg_idx;
+	if (dtrgs[leader_dtrg_idx].dtrg_write_cnt == 0)
+		ddt->ddt_flags = DTF_RDONLY;
+	ddt++;
+
+	dcdes[0].dcde_read_cnt = dtrgs[leader_dtrg_idx].dtrg_read_cnt;
+	dcdes[0].dcde_write_cnt = dtrgs[leader_dtrg_idx].dtrg_write_cnt;
+	dcdes[0].dcde_reqs = dtrgs[leader_dtrg_idx].dtrg_req_idx;
+	dtrgs[leader_dtrg_idx].dtrg_req_idx = NULL;
+
+	shard_tgts[0].st_rank = dtrgs[leader_dtrg_idx].dtrg_rank;
+	shard_tgts[0].st_tgt_id = leader_dtrg_idx;
+	shard_tgts[0].st_tgt_idx = dtrgs[leader_dtrg_idx].dtrg_tgt_idx;
+
+	for (i = 0, j = 1; i < tgt_cnt; i++) {
+		if (dtrgs[i].dtrg_req_idx == NULL || i == leader_dtrg_idx)
+			continue;
+
+		ddt->ddt_id = i;
+		if (dtrgs[i].dtrg_write_cnt == 0)
+			ddt->ddt_flags = DTF_RDONLY;
+		ddt++;
+
+		dcdes[j].dcde_read_cnt = dtrgs[i].dtrg_read_cnt;
+		dcdes[j].dcde_write_cnt = dtrgs[i].dtrg_write_cnt;
+		dcdes[j].dcde_reqs = dtrgs[i].dtrg_req_idx;
+		dtrgs[i].dtrg_req_idx = NULL;
+
+		shard_tgts[j].st_rank = dtrgs[i].dtrg_rank;
+		shard_tgts[j].st_tgt_id = i;
+		shard_tgts[j].st_tgt_idx = dtrgs[i].dtrg_tgt_idx;
+		j++;
+	}
+
+	ptr = ddt;
+	while ((dtr = d_list_pop_entry(&dtr_list, struct dc_tx_rdg,
+				       dtr_link)) != NULL) {
+		size = sizeof(dtr->dtr_group) +
+		       sizeof(uint32_t) * dtr->dtr_group.drg_tgt_cnt;
+		memcpy(ptr, &dtr->dtr_group, size);
+		ptr += size;
+		D_FREE(dtr);
+	}
+
+	tx->tx_reqs.dcs_type = DCST_REQ;
+	tx->tx_reqs.dcs_nr = req_cnt;
+	tx->tx_reqs.dcs_buf = tx->tx_req_cache + start;
+
+	tx->tx_disp.dcs_type = DCST_DISP;
+	tx->tx_disp.dcs_nr = act_tgt_cnt;
+	tx->tx_disp.dcs_buf = dcdes;
+
+	tx->tx_tgts.dcs_type = DCST_TGT;
+	tx->tx_tgts.dcs_nr = act_tgt_cnt;
+	tx->tx_tgts.dcs_buf = shard_tgts;
+
+	tx->tx_head.dcs_type = DCST_HEAD;
+	tx->tx_head.dcs_nr = 1;
+	tx->tx_head.dcs_buf = dcsh;
+
+	dc_tx_dump(tx);
+
+out:
+	if (rc != 0) {
+		for (i = 0; i < tgt_cnt; i++)
+			D_FREE(dtrgs[i].dtrg_req_idx);
+
+		for (i = 0; i < act_tgt_cnt; i++)
+			D_FREE(dcdes[i].dcde_reqs);
+
+		D_FREE(dcdes);
+		D_FREE(shard_tgts);
+		D_FREE(dcsh->dcsh_mbs);
+		D_FREE(dcsh);
+	}
+
+	while ((dtr = d_list_pop_entry(&dtr_list, struct dc_tx_rdg,
+				       dtr_link)) != NULL)
+		D_FREE(dtr);
+
+	D_FREE(dtrgs);
+
+	return rc;
+}
+
+static int
+dc_tx_commit_trigger(tse_task_t *task, struct dc_tx *tx, daos_tx_commit_t *args)
 {
 	crt_rpc_t			*req = NULL;
-	struct tx_commit_cb_args	*tcca;
+	struct obj_cpd_in		*oci;
+	struct tx_commit_cb_args	 tcca;
 	crt_endpoint_t			 tgt_ep;
 	int				 rc;
 
-	/* FIXME: Before support compounded RPC, let's use the existing
-	 *	  object update/punch RPC to commit the TX modification.
-	 */
-	if (tx->tx_write_cnt == 1)
-		return dc_tx_commit_non_cpd(task, tx);
+	if (!tx->tx_retry) {
+		rc = dc_tx_commit_prepare(tx, task);
+		if (rc != 0) {
+			if (rc == -DER_STALE)
+				rc = -DER_TX_RESTART;
 
-	D_ASSERT(0);
-
-	rc = dc_tx_elect_leader(tx);
-	if (rc != 0)
-		goto out;
+			goto out;
+		}
+	}
 
 	tgt_ep.ep_grp = tx->tx_pool->dp_sys->sy_group;
 	tgt_ep.ep_tag = tx->tx_leader_tag;
@@ -799,26 +1433,39 @@ dc_tx_commit_trigger(tse_task_t *task, struct dc_tx *tx)
 		D_GOTO(out, rc);
 
 	crt_req_addref(req);
-	tcca = crt_req_get(req);
-	D_ASSERT(tcca != NULL);
-
-	tcca->tcca_tx = tx;
-	tcca->tcca_req = req;
+	tcca.tcca_req = req;
+	tcca.tcca_tx = tx;
+	tcca.tcca_args = args;
 
 	rc = tse_task_register_comp_cb(task, dc_tx_commit_cb,
-				       tcca, sizeof(*tcca));
+				       &tcca, sizeof(tcca));
 	if (rc != 0) {
 		/* drop ref from crt_req_addref. */
 		crt_req_decref(req);
-		D_ERROR("Failed to register completion cb: rc = %d\n", rc);
+		D_ERROR("Failed to register completion cb: "DF_RC"\n",
+			DP_RC(rc));
 
 		D_GOTO(out, rc);
 	}
 
-	/* FIXME:
-	 * 1. Prepare bulk.
-	 * 2. Pack sub requests into the RPC.
-	 */
+	oci = crt_req_get(req);
+	D_ASSERT(oci != NULL);
+
+	rc = dc_cont_hdl2uuid(tx->tx_coh, &oci->oci_co_hdl, &oci->oci_co_uuid);
+	D_ASSERT(rc == 0);
+
+	uuid_copy(oci->oci_pool_uuid, tx->tx_pool->dp_pool);
+	oci->oci_map_ver = tx->tx_pm_ver;
+	oci->oci_flags = DRF_CPD_LEADER | (tx->tx_retry ? ORF_RESEND : 0);
+
+	oci->oci_sub_heads.ca_arrays = &tx->tx_head;
+	oci->oci_sub_heads.ca_count = 1;
+	oci->oci_sub_reqs.ca_arrays = &tx->tx_reqs;
+	oci->oci_sub_reqs.ca_count = 1;
+	oci->oci_disp_ents.ca_arrays = &tx->tx_disp;
+	oci->oci_disp_ents.ca_count = 1;
+	oci->oci_disp_tgts.ca_arrays = &tx->tx_tgts;
+	oci->oci_disp_tgts.ca_count = 1;
 
 	tx->tx_status = TX_COMMITTING;
 	D_MUTEX_UNLOCK(&tx->tx_lock);
@@ -832,6 +1479,9 @@ dc_tx_commit_trigger(tse_task_t *task, struct dc_tx *tx)
 out:
 	if (req != NULL)
 		crt_req_decref(req);
+
+	if (rc != 0)
+		tx->tx_status = TX_FAILED;
 
 	D_MUTEX_UNLOCK(&tx->tx_lock);
 	/* -1 for dc_tx_commit() held */
@@ -863,21 +1513,22 @@ dc_tx_commit(tse_task_t *task)
 	if (tx->tx_status == TX_COMMITTED)
 		D_GOTO(out_tx, rc = 0);
 
-	if (tx->tx_status == TX_COMMITTING) {
-		/* FIXME: Before support compounded RPC, the retry update/punch
-		 *	  RPC will hit TX_COMMITTING status TX, that is normal.
-		 */
-		D_ASSERT(tx->tx_write_cnt != 0);
-	} else if (tx->tx_status != TX_OPEN) {
+	if (tx->tx_status == TX_COMMITTING)
+		D_GOTO(out_tx, rc = -DER_INPROGRESS);
+
+	if (tx->tx_status != TX_OPEN && !(tx->tx_status == TX_FAILED &&
+	    tx->tx_retry && args->flags & DTF_RETRY_COMMIT)) {
 		D_ERROR("Can't commit non-open state TX (%d)\n",
 			tx->tx_status);
 		D_GOTO(out_tx, rc = -DER_NO_PERM);
-	} else if (tx->tx_write_cnt == 0) {
+	}
+
+	if (tx->tx_write_cnt == 0 && tx->tx_read_cnt == 0) {
 		tx->tx_status = TX_COMMITTED;
 		D_GOTO(out_tx, rc = 0);
 	}
 
-	return dc_tx_commit_trigger(task, tx);
+	return dc_tx_commit_trigger(task, tx, args);
 
 out_tx:
 	D_MUTEX_UNLOCK(&tx->tx_lock);
@@ -1110,6 +1761,9 @@ dc_tx_add_update(struct dc_tx *tx, daos_handle_t oh, uint64_t flags,
 	if (rc != 0)
 		D_GOTO(fail, rc);
 
+	dcsr->dcsr_reasb = NULL;
+	dcsr->dcsr_sgls = NULL;
+
 	dcsr->dcsr_opc = DCSO_UPDATE;
 	dcsr->dcsr_nr = nr;
 	dcsr->dcsr_dkey_hash = obj_dkey2hash(dkey);
@@ -1149,14 +1803,14 @@ dc_tx_add_update(struct dc_tx *tx, daos_handle_t oh, uint64_t flags,
 		       sizeof(daos_recx_t) * iods[i].iod_nr);
 	}
 
-	D_ALLOC_ARRAY(dcu->dcu_sgls, nr);
-	if (dcu->dcu_sgls == NULL)
+	D_ALLOC_ARRAY(dcsr->dcsr_sgls, nr);
+	if (dcsr->dcsr_sgls == NULL)
 		D_GOTO(fail, rc = -DER_NOMEM);
 
 	if (tx->tx_flags & DAOS_TF_ZERO_COPY)
-		rc = daos_sgls_copy_ptr(dcu->dcu_sgls, nr, sgls, nr);
+		rc = daos_sgls_copy_ptr(dcsr->dcsr_sgls, nr, sgls, nr);
 	else
-		rc = daos_sgls_copy_all(dcu->dcu_sgls, nr, sgls, nr);
+		rc = daos_sgls_copy_all(dcsr->dcsr_sgls, nr, sgls, nr);
 	if (rc != 0)
 		D_GOTO(fail, rc);
 
@@ -1175,12 +1829,12 @@ fail:
 			D_FREE(dcu->dcu_iods);
 		}
 
-		if (dcu->dcu_sgls != NULL) {
+		if (dcsr->dcsr_sgls != NULL) {
 			for (i = 0; i < nr; i++)
-				daos_sgl_fini(&dcu->dcu_sgls[i],
+				daos_sgl_fini(&dcsr->dcsr_sgls[i],
 					!(tx->tx_flags & DAOS_TF_ZERO_COPY));
 
-			D_FREE(dcu->dcu_sgls);
+			D_FREE(dcsr->dcsr_sgls);
 		}
 	}
 
