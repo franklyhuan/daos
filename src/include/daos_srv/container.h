@@ -113,6 +113,7 @@ struct ds_cont_child {
 	d_list_t		 sc_dtx_cos_list;
 	/* The pool map version for the latest DTX resync on the container. */
 	uint32_t		 sc_dtx_resync_ver;
+	struct dss_sleep_ult	*sc_sleep_ult;
 };
 
 /*

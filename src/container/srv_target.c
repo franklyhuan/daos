@@ -604,6 +604,10 @@ cont_child_stop(struct ds_cont_child *cont_child)
 
 		/* cont_stop_agg_ult() may yield */
 		cont_stop_agg_ult(cont_child);
+		if (cont_child->sc_sleep_ult != NULL) {
+			dss_sleep_ult_destroy(cont_child->sc_sleep_ult);
+			cont_child->sc_sleep_ult = NULL;
+		}
 		ds_cont_child_put(cont_child);
 	} else {
 		D_ASSERT(!cont_child_started(cont_child));
@@ -662,11 +666,18 @@ cont_child_start(struct ds_pool_child *pool_child, const uuid_t co_uuid,
 			DP_CONT(pool_child->spc_uuid, co_uuid), tgt_id);
 		rc = -DER_SHUTDOWN;
 	} else if (!cont_child_started(cont_child)) {
-		rc = cont_start_agg_ult(cont_child);
-		if (!rc) {
-			d_list_add_tail(&cont_child->sc_link,
-					&pool_child->spc_cont_list);
-			ds_cont_child_get(cont_child);
+		cont_child->sc_sleep_ult = dss_sleep_ult_create();
+		if (cont_child->sc_sleep_ult == NULL) {
+			D_ERROR(DF_CONT"[%d]: Failed to create sleep ULT\n",
+				DP_CONT(pool_child->spc_uuid, co_uuid), tgt_id);
+			rc = -DER_NOMEM;
+		} else {
+			rc = cont_start_agg_ult(cont_child);
+			if (!rc) {
+				d_list_add_tail(&cont_child->sc_link,
+						&pool_child->spc_cont_list);
+				ds_cont_child_get(cont_child);
+			}
 		}
 	}
 

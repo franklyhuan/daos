@@ -34,34 +34,54 @@
 #include "obj_rpc.h"
 #include "obj_internal.h"
 
+static inline bool
+obj_ec_is_valid_tgt(uint32_t *tgt_map, uint32_t map_size, uint32_t id)
+{
+	int	i;
+
+	/* XXX: The distributed transaction may contains the updates of
+	 *	multiple EC objects that share the same forward targets
+	 *	array. So for some update of EC object, the targets may
+	 *	be unordered. So checking the bitmap may be inefficient.
+	 */
+	for (i = 0; i < map_size; i++) {
+		if (tgt_map[i] == id)
+			return true;
+	}
+
+	return false;
+}
+
 /**
  * Split EC obj read/write request.
  * For object update, client sends update request to leader, the leader needs to
  * split it for different targets before dispatch.
  */
 int
-obj_ec_rw_req_split(struct obj_rw_in *orw, struct obj_ec_split_req **split_req)
+obj_ec_rw_req_split(daos_unit_oid_t oid, struct obj_iod_array *iod_array,
+		    uint32_t iod_nr, uint32_t start_shard,
+		    uint32_t map_size, uint32_t *tgt_map,
+		    struct daos_shard_tgt *fw_tgts, uint32_t tgt_nr,
+		    struct obj_ec_split_req **split_req)
 {
-	daos_iod_t		*iod, *iods = orw->orw_iod_array.oia_iods;
-	struct obj_io_desc	*oiods = orw->orw_iod_array.oia_oiods;
-	struct daos_shard_tgt	*fw_tgts = orw->orw_shard_tgts.ca_arrays;
+	daos_iod_t		*iod;
+	daos_iod_t		*iods = iod_array->oia_iods;
+	struct obj_io_desc	*oiods = iod_array->oia_oiods;
 	struct obj_ec_split_req	*req;
 	daos_iod_t		*split_iod, *split_iods;
 	struct obj_shard_iod	*siod;
 	struct obj_tgt_oiod	*tgt_oiod, *tgt_oiods = NULL;
 	struct dcs_iod_csums	*iod_csum = NULL;
-	struct dcs_iod_csums	*iod_csums = orw->orw_iod_array.oia_iod_csums;
+	struct dcs_iod_csums	*iod_csums = iod_array->oia_iod_csums;
 	struct dcs_iod_csums	*split_iod_csum = NULL;
 	struct dcs_iod_csums	*split_iod_csums;
-	uint32_t		 tgt_nr = orw->orw_shard_tgts.ca_count;
-	uint32_t		 iod_nr = orw->orw_nr;
-	uint32_t		 start_shard = orw->orw_start_shard;
 	uint32_t		 i, tgt_idx, tgt_max_idx;
 	daos_size_t		 req_size, iods_size;
 	daos_size_t		 csums_size = 0, singv_ci_size = 0;
 	uint8_t			 tgt_bit_map[OBJ_TGT_BITMAP_LEN] = {0};
 	bool			 with_csums = (iod_csums != NULL);
 	void			*buf = NULL;
+	int			 count = 0;
 	int			 rc = 0;
 
 	/* minimal K/P is 2/1, so at least 1 forward targets */
@@ -72,7 +92,7 @@ obj_ec_rw_req_split(struct obj_rw_in *orw, struct obj_ec_split_req **split_req)
 	 */
 	D_ASSERT((oiods[0].oiod_flags & OBJ_SIOD_SINGV) ||
 		 oiods[0].oiod_nr >= 2);
-	tgt_max_idx = orw->orw_oid.id_shard - start_shard;
+	tgt_max_idx = oid.id_shard - start_shard;
 
 	req_size = roundup(sizeof(struct obj_ec_split_req), 8);
 	iods_size = roundup(sizeof(daos_iod_t) * iod_nr, 8);
@@ -93,18 +113,27 @@ obj_ec_rw_req_split(struct obj_rw_in *orw, struct obj_ec_split_req **split_req)
 	req->osr_start_shard = start_shard;
 
 	for (i = 0; i < tgt_nr; i++) {
+		if (tgt_map != NULL &&
+		    !obj_ec_is_valid_tgt(tgt_map, map_size,
+					 fw_tgts[i].st_tgt_id))
+			continue;
+
 		tgt_idx = fw_tgts[i].st_shard - start_shard;
 		D_ASSERT(tgt_idx < tgt_max_idx);
 		setbit(tgt_bit_map, tgt_idx);
+		count++;
 	}
+
+	D_ASSERT(count == map_size);
+
 	setbit(tgt_bit_map, tgt_max_idx);
 
 	tgt_oiods = obj_ec_tgt_oiod_init(oiods, iod_nr, tgt_bit_map,
-					 tgt_max_idx, tgt_nr + 1);
+					 tgt_max_idx, count + 1);
 	if (tgt_oiods == NULL)
 		D_GOTO(out, rc = -DER_NOMEM);
 	req->osr_tgt_oiods = tgt_oiods;
-	tgt_oiod = obj_ec_tgt_oiod_get(tgt_oiods, tgt_nr + 1, tgt_max_idx);
+	tgt_oiod = obj_ec_tgt_oiod_get(tgt_oiods, count + 1, tgt_max_idx);
 	D_ASSERT(tgt_oiod != NULL && tgt_oiod->oto_tgt_idx == tgt_max_idx);
 	req->osr_offs = tgt_oiod->oto_offs;
 
