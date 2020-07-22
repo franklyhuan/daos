@@ -42,53 +42,29 @@ pool_create_all(void **state)
 	test_arg_t	*arg = *state;
 	uuid_t		 uuid;
 	char		 uuid_str[64];
-	daos_event_t	 ev;
-	daos_event_t	*evp;
 	int		 rc;
 
 	if (arg->async) {
-		rc = daos_event_init(&ev, arg->eq, NULL);
-		assert_int_equal(rc, 0);
+		print_message("async not supported");
+		return;
 	}
-
 
 	/** create container */
-	print_message("creating pool %ssynchronously ... ",
-		      arg->async ? "a" : "");
-	rc = daos_pool_create(0700 /* mode */, 0 /* uid */, 0 /* gid */,
-			      arg->group, NULL /* tgts */, "pmem" /* dev */,
-			      0 /* minimal size */, 0 /* nvme size */,
-			      NULL /* properties */, &arg->pool.svc /* svc */,
-			      uuid, arg->async ? &ev : NULL);
+	print_message("creating pool synchronously ... ");
+	rc = dmg_pool_create(dmg_config_file, 0 /* uid */, 0 /* gid */,
+			     arg->group, NULL /* tgts */,
+			     0 /* minimal size */, 0 /* nvme size */,
+			     &arg->pool.svc /* svc */, uuid);
 	assert_int_equal(rc, 0);
-
-	if (arg->async) {
-		/** wait for container creation */
-		rc = daos_eq_poll(arg->eq, 1, DAOS_EQ_WAIT, 1, &evp);
-		assert_int_equal(rc, 1);
-		assert_ptr_equal(evp, &ev);
-		assert_int_equal(ev.ev_error, 0);
-	}
 
 	uuid_unparse_lower(uuid, uuid_str);
 	print_message("success uuid = %s\n", uuid_str);
 
 	/** destroy container */
-	print_message("destroying pool %ssynchronously ... ",
-		      arg->async ? "a" : "");
-	rc = daos_pool_destroy(uuid, arg->group, 1, arg->async ? &ev : NULL);
+	print_message("destroying pool synchronously ... ");
+	rc = dmg_pool_destroy(dmg_config_file, uuid, arg->group, 1);
 	assert_int_equal(rc, 0);
 
-	if (arg->async) {
-		/** for container destroy */
-		rc = daos_eq_poll(arg->eq, 1, DAOS_EQ_WAIT, 1, &evp);
-		assert_int_equal(rc, 1);
-		assert_ptr_equal(evp, &ev);
-		assert_int_equal(ev.ev_error, 0);
-
-		rc = daos_event_fini(&ev);
-		assert_int_equal(rc, 0);
-	}
 	print_message("success\n");
 }
 
@@ -125,7 +101,7 @@ setup_pools(void **state, daos_size_t npools)
 
 		/* Create the pool */
 		rc = test_setup_pool_create(state, NULL /* ipool */,
-				&lparg->tpools[i], NULL /* prop */);
+				&lparg->tpools[i]);
 		if (rc != 0)
 			goto err_destroy_pools;
 	}
@@ -402,11 +378,10 @@ pool_create_and_destroy_retry(void **state)
 	print_message("success\n");
 
 	print_message("creating pool synchronously ... ");
-	rc = daos_pool_create(0700 /* mode */, 0 /* uid */, 0 /* gid */,
-			      arg->group, NULL /* tgts */, "pmem" /* dev */,
-			      0 /* minimal size */, 0 /* nvme size */,
-			      NULL /* properties */, &arg->pool.svc /* svc */,
-			      uuid, NULL /* ev */);
+	rc = dmg_pool_create(dmg_config_file, 0 /* uid */, 0 /* gid */,
+			     arg->group, NULL /* tgts */,
+			     0 /* minimal size */, 0 /* nvme size */,
+			     &arg->pool.svc /* svc */, uuid);
 	assert_int_equal(rc, 0);
 	print_message("success uuid = "DF_UUIDF"\n", DP_UUID(uuid));
 
@@ -418,7 +393,7 @@ pool_create_and_destroy_retry(void **state)
 	print_message("success\n");
 
 	print_message("destroying pool synchronously ... ");
-	rc = daos_pool_destroy(uuid, arg->group, 1, NULL);
+	rc = dmg_pool_destroy(dmg_config_file, uuid, arg->group, 1);
 #if 0 /* see pool_create_cp */
 	assert_int_equal(rc, 0);
 #else

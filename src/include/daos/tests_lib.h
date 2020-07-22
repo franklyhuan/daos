@@ -208,4 +208,12 @@ dts_create_config(char buf[DTS_CFG_MAX], const char *format, ...)
 		buf[DTS_CFG_MAX - 1] = 0;
 }
 
+int dmg_pool_create(const char *dmg_config_file,
+		    uid_t uid, gid_t gid, const char *grp,
+		    const d_rank_list_t *tgts,
+		    daos_size_t scm_size, daos_size_t nvme_size,
+		    d_rank_list_t *svc, uuid_t uuid);
+int dmg_pool_destroy(const char *dmg_config_file,
+		     const uuid_t uuid, const char *grp, int force);
+
 #endif /* __DAOS_TESTS_LIB_H__ */

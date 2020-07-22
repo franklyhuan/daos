@@ -68,12 +68,13 @@ func (cmd *firmwareQueryCmd) Execute(args []string) error {
 
 	req.SetHostList(cmd.hostlist)
 	resp, err := control.FirmwareQuery(ctx, cmd.ctlInvoker, req)
-	if err != nil {
-		return err
-	}
 
 	if cmd.jsonOutputEnabled() {
-		return cmd.outputJSON(os.Stdout, resp)
+		return cmd.outputJSON(os.Stdout, resp, err)
+	}
+
+	if err != nil {
+		return err
 	}
 
 	var bld strings.Builder
@@ -125,12 +126,13 @@ func (cmd *firmwareUpdateCmd) Execute(args []string) error {
 
 	req.SetHostList(cmd.hostlist)
 	resp, err := control.FirmwareUpdate(ctx, cmd.ctlInvoker, req)
-	if err != nil {
-		return err
-	}
 
 	if cmd.jsonOutputEnabled() {
-		return cmd.outputJSON(os.Stdout, resp)
+		return cmd.outputJSON(os.Stdout, resp, err)
+	}
+
+	if err != nil {
+		return err
 	}
 
 	var bld strings.Builder
