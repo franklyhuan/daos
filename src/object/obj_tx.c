@@ -47,6 +47,25 @@ enum dc_tx_status {
 	TX_FAILED,
 };
 
+static char *
+status_str(enum dc_tx_status status)
+{
+	switch (status) {
+	case TX_OPEN:
+		return "OPEN";
+	case TX_COMMITTING:
+		return "COMMITTING";
+	case TX_COMMITTED:
+		return "COMMITTED";
+	case TX_ABORTED:
+		return "ABORTED";
+	case TX_FAILED:
+		return "FAILED";
+	default:
+		return "UNKNOWN";
+	}
+}
+
 /* Request cache for each modification in the TX */
 struct dc_tx_sub_req {
 	/* link into dc_tx::tx_sub_reqs. */
@@ -169,6 +188,14 @@ dc_tx_hdl_unlink(struct dc_tx *tx)
 	daos_hhash_link_delete(&tx->tx_hlink);
 }
 
+static void
+dc_tx_change_state(struct dc_tx *tx, enum dc_tx_status status)
+{
+	D_DEBUG(DB_IO, DF_X64": %s -> %s\n", dc_tx_ptr2hdl(tx).cookie,
+		status_str(tx->tx_status), status_str(status));
+	tx->tx_status = status;
+}
+
 static int
 dc_tx_alloc(daos_handle_t coh, daos_epoch_t epoch, uint64_t flags,
 	    struct dc_tx **ptx)
@@ -278,21 +305,28 @@ dc_tx_cleanup(struct dc_tx *tx)
 		  tx->tx_sub_count);
 }
 
-/** Set the epoch of \a th to \a epoch. */
+/**
+ * End a operation associated with transaction \a th.
+ *
+ * \param[in]	task		current task
+ * \param[in]	th		transaction handle
+ * \param[in]	req_epoch	request epoch
+ * \param[in]	rep_rc		reply rc
+ * \param[in]	rep_epoch	reply epoch
+ */
 int
-dc_tx_set_epoch(tse_task_t *task, daos_handle_t th, daos_epoch_t epoch)
+dc_tx_op_end(tse_task_t *task, daos_handle_t th, struct dtx_epoch *req_epoch,
+	     int rep_rc, daos_epoch_t rep_epoch)
 {
 	struct dc_tx	*tx;
 	int		 rc = 0;
 
 	D_ASSERT(task != NULL);
+	D_ASSERT(daos_handle_is_valid(th));
 
-	if (epoch == 0) {
+	if (rep_rc != -DER_TX_RESTART &&
+	    (dtx_epoch_chosen(req_epoch) || rep_epoch == 0))
 		return 0;
-	} else if (epoch == DAOS_EPOCH_MAX) {
-		D_ERROR("invalid epoch: DAOS_EPOCH_MAX\n");
-		return -DER_INVAL;
-	}
 
 	tx = dc_tx_hdl2ptr(th);
 	if (tx == NULL) {
@@ -300,28 +334,39 @@ dc_tx_set_epoch(tse_task_t *task, daos_handle_t th, daos_epoch_t epoch)
 			th.cookie);
 		return -DER_NO_HDL;
 	}
-
 	D_MUTEX_LOCK(&tx->tx_lock);
+
 	if (tx->tx_status != TX_OPEN && tx->tx_status != TX_FAILED &&
 	    tx->tx_status != TX_COMMITTING) {
 		D_ERROR("Can't set epoch on non-open/non-failed/non-committing "
 			"TX (%d)\n", tx->tx_status);
 		rc = -DER_NO_PERM;
-	} else if (tx->tx_epoch_task == task) {
+		goto out;
+	}
+
+	if (rep_rc == -DER_TX_RESTART)
+		dc_tx_change_state(tx, TX_FAILED);
+
+	if (rep_epoch == DAOS_EPOCH_MAX) {
+		D_ERROR("invalid reply epoch: DAOS_EPOCH_MAX\n");
+		rc = -DER_PROTO;
+		goto out;
+	}
+
+	if (tx->tx_epoch_task == task) {
 		D_ASSERT(!dtx_epoch_chosen(&tx->tx_epoch));
-		tx->tx_epoch.oe_value = epoch;
+		tx->tx_epoch.oe_value = rep_epoch;
 		if (tx->tx_epoch.oe_first == 0)
 			tx->tx_epoch.oe_first = tx->tx_epoch.oe_value;
-		tx->tx_epoch.oe_flags &= ~DTX_EPOCH_HINT;
 		D_DEBUG(DB_IO, DF_X64"/%p: set: value="DF_U64" first="DF_U64
 			" flags="DF_X64"\n", th.cookie, task,
 			tx->tx_epoch.oe_value, tx->tx_epoch.oe_first,
 			tx->tx_epoch.oe_flags);
 	}
+
+out:
 	D_MUTEX_UNLOCK(&tx->tx_lock);
-
 	dc_tx_decref(tx);
-
 	return rc;
 }
 
@@ -380,7 +425,7 @@ dc_tx_check_pmv_internal(daos_handle_t th, struct dc_tx **ptx)
 			  tx->tx_pm_ver, pm_ver);
 
 		tx->tx_pm_ver = pm_ver;
-		tx->tx_status = TX_FAILED;
+		dc_tx_change_state(tx, TX_FAILED);
 		rc = -DER_TX_RESTART;
 	}
 
@@ -524,6 +569,12 @@ dc_tx_get_epoch(tse_task_t *task, daos_handle_t th, struct dtx_epoch *epoch)
 	}
 	D_MUTEX_LOCK(&tx->tx_lock);
 
+	if (tx->tx_status == TX_FAILED) {
+		D_DEBUG(DB_IO, DF_X64"/%p: already failed\n", th.cookie, task);
+		rc = -DER_OP_CANCELED;
+		goto out;
+	}
+
 	if (dtx_epoch_chosen(&tx->tx_epoch)) {
 		/* The TX epoch is chosen before we acquire the lock. */
 		*epoch = tx->tx_epoch;
@@ -541,6 +592,8 @@ dc_tx_get_epoch(tse_task_t *task, daos_handle_t th, struct dtx_epoch *epoch)
 		if (rc != 0) {
 			D_ERROR("cannot register completion callback: "DF_RC
 				"\n", DP_RC(rc));
+			tse_task_decref(tx->tx_epoch_task);
+			tx->tx_epoch_task = NULL;
 			goto out;
 		}
 		*epoch = tx->tx_epoch;
@@ -634,11 +687,11 @@ dc_tx_commit_cb(tse_task_t *task, void *data)
 	D_MUTEX_LOCK(&tx->tx_lock);
 
 	if (rc == 0) {
-		tx->tx_status = TX_COMMITTED;
+		dc_tx_change_state(tx, TX_COMMITTED);
 		goto out;
 	}
 
-	tx->tx_status = TX_FAILED;
+	dc_tx_change_state(tx, TX_FAILED);
 
 	/* Required to restart the TX with newer epoch. */
 	if (rc == -DER_TX_RESTART)
@@ -678,9 +731,9 @@ dc_tx_non_cpd_cb(daos_handle_t th, int result)
 
 	D_MUTEX_LOCK(&tx->tx_lock);
 	if (result != 0)
-		tx->tx_status = TX_FAILED;
+		dc_tx_change_state(tx, TX_FAILED);
 	else
-		tx->tx_status = TX_COMMITTED;
+		dc_tx_change_state(tx, TX_COMMITTED);
 	D_MUTEX_UNLOCK(&tx->tx_lock);
 
 	dc_tx_decref(tx);
@@ -696,7 +749,7 @@ dc_tx_commit_non_cpd(tse_task_t *task, struct dc_tx *tx)
 	uint32_t		 pm_ver = tx->tx_pm_ver;
 	int			 rc;
 
-	tx->tx_status = TX_COMMITTING;
+	dc_tx_change_state(tx, TX_COMMITTING);
 	dtsr = d_list_entry(tx->tx_sub_reqs.next, struct dc_tx_sub_req,
 			    dtsr_link);
 
@@ -785,7 +838,7 @@ dc_tx_commit_trigger(tse_task_t *task, struct dc_tx *tx)
 	 * 2. Pack sub requests into the RPC.
 	 */
 
-	tx->tx_status = TX_COMMITTING;
+	dc_tx_change_state(tx, TX_COMMITTING);
 	D_MUTEX_UNLOCK(&tx->tx_lock);
 
 	rc = daos_rpc_send(req, task);
@@ -843,7 +896,7 @@ dc_tx_commit(tse_task_t *task)
 			tx->tx_status);
 		D_GOTO(out_tx, rc = -DER_NO_PERM);
 	} else if (d_list_empty(&tx->tx_sub_reqs)) {
-		tx->tx_status = TX_COMMITTED;
+		dc_tx_change_state(tx, TX_COMMITTED);
 		D_GOTO(out_tx, rc = 0);
 	}
 
@@ -892,7 +945,7 @@ dc_tx_abort(tse_task_t *task)
 		D_GOTO(out_tx, rc = -DER_NO_PERM);
 	}
 
-	tx->tx_status = TX_ABORTED;
+	dc_tx_change_state(tx, TX_ABORTED);
 
 out_tx:
 	D_MUTEX_UNLOCK(&tx->tx_lock);
@@ -988,9 +1041,8 @@ dc_tx_restart(tse_task_t *task)
 	} else {
 		dc_tx_cleanup(tx);
 
-		tx->tx_status = TX_OPEN;
-		if (dtx_epoch_chosen(&tx->tx_epoch))
-			tx->tx_epoch.oe_flags |= DTX_EPOCH_HINT;
+		dc_tx_change_state(tx, TX_OPEN);
+		tx->tx_epoch.oe_value = 0;
 		if (tx->tx_epoch_task != NULL) {
 			tse_task_decref(tx->tx_epoch_task);
 			tx->tx_epoch_task = NULL;
