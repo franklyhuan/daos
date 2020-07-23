@@ -999,7 +999,7 @@ pipeline {
                       expression { ! skip_stage('run_test') }
                     }
                     agent {
-                        label 'ci_vm1'
+                        label 'stage_vm1'
                     }
                     steps {
                         unitTest timeout_time: 60,
@@ -1077,7 +1077,7 @@ pipeline {
                         expression { ! skip_stage('func-test') }
                     }
                     agent {
-                        label 'ci_vm9'
+                        label 'stage_vm9'
                     }
                     steps {
                         functionalTest inst_repos: daos_repos("centos7"),
@@ -1097,7 +1097,7 @@ pipeline {
                         expression { ! skip_stage('func-test-leap15') }
                     }
                     agent {
-                        label 'ci_vm9'
+                        label 'stage_vm9'
                     }
                     steps {
                         functionalTest target: 'leap15',
@@ -1123,7 +1123,7 @@ pipeline {
                     }
                     agent {
                         // 2 node cluster with 1 IB/node + 1 test control node
-                        label 'ci_nvme3'
+                        label 'stage_nvme3'
                     }
                     steps {
                         functionalTest target: hw_distro("small"),
@@ -1202,7 +1202,7 @@ pipeline {
                         }
                     }
                     agent {
-                        label 'ci_vm1'
+                        label 'stage_vm1'
                     }
                     steps {
                         testRpm inst_repos: daos_repos('centos7'),
@@ -1220,7 +1220,7 @@ pipeline {
                         }
                     }
                     agent {
-                        label 'ci_vm1'
+                        label 'stage_vm1'
                     }
                     steps {
                         testRpm inst_repos: daos_repos('centos7'),
